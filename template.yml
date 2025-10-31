@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Infraestrutura para automação de processamento de dados (S3 + Lambda via CloudFormation e LocalStack)"
+
+Resources:
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: raw-data-bucket
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: processed-data-bucket
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: "*"
+
+  DataProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: process_data_lambda
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3', endpoint_url='http://localhost:4566')
+              source_bucket = 'raw-data-bucket'
+              target_bucket = 'processed-data-bucket'
+              for record in event['Records']:
+                  key = record['s3']['object']['key']
+                  obj = s3.get_object(Bucket=source_bucket, Key=key)
+                  data = obj['Body'].read().decode('utf-8')
+                  lines = list(csv.reader(io.StringIO(data)))
+                  unique = [list(x) for x in {tuple(row) for row in lines}]
+                  out_csv = io.StringIO()
+                  csv.writer(out_csv).writerows(unique)
+                  s3.put_object(Bucket=target_bucket, Key=f'processed-{key}', Body=out_csv.getvalue())
+              return {'status': 'success'}
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessingFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceArn: !GetAtt RawDataBucket.Arn
+
+  BucketNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref RawDataBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt DataProcessingFunction.Arn
